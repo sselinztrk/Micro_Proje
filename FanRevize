@@ -1,0 +1,289 @@
+;====================================================================
+; Proje: Home Automation - Board #1 (Air Conditioner)
+; İsim: Selin Öztürk
+; İşlemci: PIC16F877A
+;====================================================================
+
+    list p=16f877A
+    #include <p16f877A.inc>
+
+    ; Konfigürasyon Bitleri
+    __CONFIG _FOSC_HS & _WDTE_OFF & _PWRTE_ON & _BOREN_ON & _LVP_OFF & _CPD_OFF & _WRT_OFF & _CP_OFF
+
+    CBLOCK 0x20             ; RAM başlangıç
+        Desired_Temp_Int    ; Hedef Sıcaklık Tam Sayı
+        Desired_Temp_Frac   ; Hedef Sıcaklık Kesirli
+        Ambient_Temp_Int    ; Ortam Sıcaklığı Tam Sayı
+        Ambient_Temp_Frac   ; Ortam Sıcaklığı Kesirli
+        Fan_Speed           ; Fan Hızı
+        w_temp              ; Kesme yedeği W
+        status_temp         ; Kesme yedeği STATUS
+        Display_Counter     
+        Wait_Counter        ; Gecikme sayacı
+	Tens            ; Onlar basamağı
+        Ones            ; Birler basamağı
+	
+    ENDC
+
+;====================================================================
+; RESET VE KESME VEKTÖRLERİ
+;====================================================================
+    ORG     0x000           
+    GOTO    Init            
+
+    ORG     0x004           
+    GOTO    ISR             
+
+;====================================================================
+; BAŞLANGIÇ AYARLARI (INITIALIZATION)
+;====================================================================
+Init:
+    ; --- Bank 1 ---
+    BANKSEL TRISA           
+
+    ; ADCON1: ADFM=1 (Sağa Dayalı), AN0 Analog
+    MOVLW   b'10000100'     
+    MOVWF   ADCON1
+
+    ; TRISA: RA1(Input-Sensör), RA2-RA3-RA5(Output-Ekran)
+    BANKSEL TRISA
+    MOVLW   b'00000010'     ; Sadece RA1 Input (Bit 1 = 1), Diğerleri Output (0)
+    MOVWF   TRISA
+    
+    ; TRISB: RB4-RB7 Input (Keypad Rows)
+    MOVLW   b'11110000'     
+    MOVWF   TRISB
+
+    ; TRISC: RC7 Input (RX), RC6 Output (TX)
+    MOVLW   b'10000000'     
+    MOVWF   TRISC
+
+    ; TRISD: Output (7-Segment)
+    CLRF    TRISD
+
+    ; --- Bank 0 ---
+    BANKSEL PORTA           
+    CLRF    PORTA
+    CLRF    PORTB
+    CLRF    PORTC
+    CLRF    PORTD
+    CLRF    PORTE
+
+    ; --- Varsayılan Değerler ---
+    MOVLW   d'25'           ; Hedef: 25 Derece
+    MOVWF   Desired_Temp_Int
+    CLRF    Desired_Temp_Frac
+    
+    BCF     PORTC, 0        ; Heater OFF
+    BCF     PORTC, 1        ; Cooler OFF
+
+    ; ADC Ayarlarını Yap
+    CALL    Init_ADC 
+    GOTO    MainLoop
+
+; ANA DÖNGÜ
+;====================================================================
+MainLoop:
+    ; 1. Sıcaklığı Oku
+    CALL    Read_Temperature    
+
+    ; 2. Ekran için Basamakları Hesapla (Hex -> Dec)
+    CALL    Calculate_Display
+
+    ; 3. Karar Ver (Fan/Isıtıcı)
+    CALL    Control_Logic
+    
+    ; 4. Ekranı Tazele (Göz kırpmaması için burayı birkaç kez çağırabiliriz)
+    CALL    Refresh_Display
+    
+    GOTO    MainLoop
+
+;====================================================================
+; KONTROL MANTIĞI (HEATER / COOLER)
+;====================================================================
+Control_Logic:
+    BANKSEL Ambient_Temp_Int
+    MOVF    Desired_Temp_Int, W
+    SUBWF   Ambient_Temp_Int, W  ; W = Ambient - Desired
+    
+    BTFSC   STATUS, Z       ; Eşit mi?
+    GOTO    Turn_Off_All    
+
+    BTFSS   STATUS, C       ; Negatif mi? (Ambient < Desired)
+    GOTO    Turn_On_Heater  ; Evet, Isıt
+
+    GOTO    Turn_On_Cooler  ; Hayır, Soğut
+
+Turn_On_Heater:
+    BSF     PORTC, 0        ; Heater ON
+    BCF     PORTC, 1        ; Cooler OFF
+    RETURN
+
+Turn_On_Cooler:
+    BCF     PORTC, 0        ; Heater OFF
+    BSF     PORTC, 1        ; Cooler ON
+    RETURN
+
+Turn_Off_All:
+    BCF     PORTC, 0
+    BCF     PORTC, 1
+    RETURN
+
+;====================================================================
+; ALT PROGRAMLAR (Eksik olan kısımlar burasıydı)
+;====================================================================
+
+; --- ADC Başlatma ---
+Init_ADC:
+    BANKSEL ADCON0
+    ; Fosc/32 (10), Channel 0 (000), ADON (1) -> 10000001
+    MOVLW   b'10001001'
+    MOVWF   ADCON0
+    RETURN
+
+; --- Sıcaklık Okuma ve Çevirme ---
+Read_Temperature:
+    CALL    Delay_20us      ; Kapasitör dolumu için bekle
+
+    BANKSEL ADCON0
+    BSF     ADCON0, GO      ; Dönüşümü Başlat
+
+Wait_ADC:
+    BTFSC   ADCON0, GO      ; Bitti mi?
+    GOTO    Wait_ADC        ; Bekle
+
+    ; Sonucu Oku (Sağa Dayalı: ADRESH(2 bit) - ADRESL(8 bit))
+    BANKSEL ADRESL
+    MOVF    ADRESL, W
+
+    banksel ADCON0
+    MOVWF   Ambient_Temp_Frac
+    
+    BANKSEL ADRESH
+    MOVF    ADRESH, W
+    MOVWF   Ambient_Temp_Int  ; Geçici
+
+    ; Hesaplama: Sıcaklık = ADC / 2
+    ; (1024 adım * 5V ref -> ~5mV adım. LM35 10mV/C. Yani ADC değeri sıcaklığın 2 katı)
+    
+    BANKSEL Ambient_Temp_Int
+    BCF     STATUS, C           ; Carry temizle
+    RRF     Ambient_Temp_Int, F ; High byte'ı kaydır (En düşük bit Carry'e düşer)
+    RRF     Ambient_Temp_Frac, F; Low byte'ı kaydır (Carry en tepeye girer)
+
+    ; Sonuç artık Ambient_Temp_Frac içinde tam sayı olarak duruyor
+    MOVF    Ambient_Temp_Frac, W
+    MOVWF   Ambient_Temp_Int    ; Gerçek sıcaklığı yerine koy
+    
+    CLRF    Ambient_Temp_Frac   ; Kesirli kısmı şimdilik sıfırla
+    RETURN
+
+; --- Gecikme ---
+Delay_20us:
+    MOVLW   d'10'
+    MOVWF   Wait_Counter
+Delay_Loop:
+    DECFSZ  Wait_Counter, F
+    GOTO    Delay_Loop
+    RETURN
+
+; INTERRUPT SERVICE
+
+ISR:
+    MOVWF   w_temp
+    SWAPF   STATUS, W
+    MOVWF   status_temp
+
+    ; Kesme kodları buraya...
+
+    SWAPF   status_temp, W
+    MOVWF   STATUS
+    SWAPF   w_temp, F
+    SWAPF   w_temp, W
+    RETFIE
+
+; 7-SEGMENT DISPLAY ALT PROGRAMLARI
+
+
+Get_7Seg:
+    ANDLW   0x0F            ; Güvenlik için sadece ilk 4 bite bak
+    ADDWF   PCL, F          ; Program sayacına ekle (Switch-Case mantığı)
+    RETLW   b'00111111'     ; 0
+    RETLW   b'00000110'     ; 1
+    RETLW   b'01011011'     ; 2
+    RETLW   b'01001111'     ; 3
+    RETLW   b'01100110'     ; 4
+    RETLW   b'01101101'     ; 5
+    RETLW   b'01111101'     ; 6
+    RETLW   b'00000111'     ; 7
+    RETLW   b'01111111'     ; 8
+    RETLW   b'01101111'     ; 9
+    RETURN
+
+; --- Sıcaklığı Basamaklara Ayır (Hex -> Decimal) ---
+; Ambient_Temp_Int içindeki değeri (Örn: 25) Onlar ve Birler'e ayırır
+Calculate_Display:
+    MOVF    Ambient_Temp_Int, W
+    MOVWF   Ones            ; Geçici olarak hepsini birler'e at
+    CLRF    Tens            ; Onlar basamağını sıfırla
+
+Calc_Loop:
+    MOVLW   d'10'
+    SUBWF   Ones, W         ; Ones - 10
+    BTFSS   STATUS, C       ; Sonuç negatif mi? (Ones < 10?)
+    GOTO    Calc_Done       ; Evet, bitir.
+    
+    MOVWF   Ones            ; Hayır, kalanı geri yükle
+    INCF    Tens, F         ; Onlar basamağını 1 artır
+    GOTO    Calc_Loop
+Calc_Done:
+    RETURN
+
+; --- Ekranı Tazele (Multiplexing) ---
+; Bağlantılar: D1(Onlar)=RA2, D2(Birler)=RA3, Derece=RA5
+Refresh_Display:
+    ; --- 1. HANE: ONLAR BASAMAĞI ---
+    MOVF    Tens, W
+    CALL    Get_7Seg        ; Tablodan kodu al
+    BANKSEL PORTD
+    MOVWF   PORTD           ; Segmentlere gönder
+    
+    BANKSEL PORTA
+    BSF     PORTA, 2        ; D1 (RA2) Aç
+    CALL    Delay_5ms       ; Biraz bekle (Göz görsün)
+    BCF     PORTA, 2        ; D1 Kapat
+    
+    ; --- 2. HANE: BİRLER BASAMAĞI ---
+    MOVF    Ones, W
+    CALL    Get_7Seg
+    BANKSEL PORTD
+    MOVWF   PORTD
+    
+    BANKSEL PORTA
+    BSF     PORTA, 3        ; D2 (RA3) Aç
+    CALL    Delay_5ms
+    BCF     PORTA, 3        ; D2 Kapat
+
+    ; --- 3. HANE: "C" veya Derece işareti ---
+    MOVLW   b'01011000'     ; 'c' harfi veya derece sembolü (buna göre değişebilir)
+    BANKSEL PORTD
+    MOVWF   PORTD
+    
+    BANKSEL PORTA
+    BSF     PORTA, 5        ; D3 (RA5) Aç
+    CALL    Delay_5ms
+    BCF     PORTA, 5        ; D3 Kapat
+    
+    RETURN
+
+; --- Kısa Gecikme (Multiplexing için) ---
+Delay_5ms:
+    MOVLW   d'250'
+    MOVWF   Wait_Counter
+Delay_5ms_Loop:
+    NOP
+    DECFSZ  Wait_Counter, F
+    GOTO    Delay_5ms_Loop
+    RETURN
+    
+    END
